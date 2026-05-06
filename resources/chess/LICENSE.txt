@@ -1,0 +1,23 @@
+Chess piece PNGs in this directory were downloaded from:
+https://sashite.dev/assets/chess/
+
+Source project:
+Sashite Chess Assets by Cyril Kato
+
+License:
+CC0 1.0 Universal (Public Domain)
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Files downloaded on 2026-05-06:
+- white_king.png
+- white_queen.png
+- white_rook.png
+- white_bishop.png
+- white_knight.png
+- white_pawn.png
+- black_king.png
+- black_queen.png
+- black_rook.png
+- black_bishop.png
+- black_knight.png
+- black_pawn.png

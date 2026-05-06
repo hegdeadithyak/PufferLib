@@ -404,6 +404,12 @@ def eval(env_name, args=None, load_path=None):
     args['reset_state'] = False
     args['train']['horizon'] = 1
 
+    if env_name == 'chess' and args.get('render_mode') == 'human':
+        args['env']['human_side'] = args['env'].get('human_side', 1) or 1
+        args['vec']['total_agents'] = 1
+        args['vec']['num_buffers'] = 1
+        args['vec']['num_threads'] = 1
+
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
 
