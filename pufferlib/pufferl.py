@@ -502,7 +502,7 @@ def load_config(env_name):
     return dict(args)
 
 def main():
-    err = 'Usage: puffer [train, eval, sweep, paretosweep] [env_name] [optional args]. --help for more info'
+    err = 'Usage: puffer [train, eval, sweep, paretosweep, alphazero] [env_name] [optional args]. --help for more info'
     if len(sys.argv) < 3:
         raise ValueError(err)
 
@@ -514,6 +514,9 @@ def main():
         train(env_name=env_name, args=args)
     elif 'eval' in mode:
         eval(env_name=env_name, args=args)
+    elif mode in ('alphazero', 'az'):
+        import pufferlib.alphazero
+        pufferlib.alphazero.train(env_name=env_name, args=args)
     elif 'sweep' in mode:
         sweep(env_name=env_name, args=args, pareto='pareto' in mode)
     else:

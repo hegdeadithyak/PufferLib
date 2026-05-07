@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+for candidate in \
+	/usr/games/stockfish \
+	/usr/bin/stockfish \
+	/usr/local/bin/stockfish
+do
+	if [ -x "$candidate" ]; then
+		exec "$candidate"
+	fi
+done
+
+cache_dir=/tmp/pufferlib_stockfish
+binary="$cache_dir/stockfish/stockfish-ubuntu-x86-64-avx2"
+archive=/home/amma/Downloads/stockfish-ubuntu-x86-64-avx2.tar
+
+if [ ! -x "$binary" ] && [ -f "$archive" ]; then
+	mkdir -p "$cache_dir"
+	tar -xf "$archive" -C "$cache_dir" stockfish/stockfish-ubuntu-x86-64-avx2
+	chmod +x "$binary"
+fi
+
+if [ -x "$binary" ]; then
+	exec "$binary"
+fi
+
+echo "stockfish not found" >&2
+exit 127

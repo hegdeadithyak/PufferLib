@@ -5,14 +5,19 @@
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
+#include <math.h>
 #include "raylib.h"
+#include "stockfish_wrapper.h"
 
-// ── Board dimensions ──────────────────────────────────────────────────────
+//Board dimensions
 #define BOARD_SQ    64
 #define MAX_MOVES   256
 #define CHESS_OBS_AUX  7
-#define CHESS_OBS_SIZE (12 * BOARD_SQ + CHESS_OBS_AUX)
-#define CHESS_ACT_SIZE MAX_MOVES
+#define CHESS_BOARD_OBS_SIZE (12 * BOARD_SQ + CHESS_OBS_AUX)
+#define ACTION_SPACE_SIZE (BOARD_SQ * 73)
+#define CHESS_ACTION_MASK_OFFSET CHESS_BOARD_OBS_SIZE
+#define CHESS_OBS_SIZE (CHESS_BOARD_OBS_SIZE + ACTION_SPACE_SIZE)
+#define CHESS_ACT_SIZE ACTION_SPACE_SIZE
 #define POSITION_HISTORY_LEN 128
 #define BOARD_SIZE  512
 #define BOARD_PAD   24
@@ -23,7 +28,7 @@
 #define BOARD_LEFT  BOARD_PAD
 #define BOARD_TOP   BOARD_PAD
 
-// ── Piece encoding  (0=empty, 1-6=white, 7-12=black) ─────────────────────
+//Piece encoding (0=empty, 1-6=white, 7-12=black)
 #define EMPTY    0
 #define W_PAWN   1
 #define W_KNIGHT 2
@@ -47,7 +52,7 @@
 //Rewards
 #define REWARD_WIN      1.0f
 #define REWARD_LOSS    -1.0f
-#define REWARD_DRAW     0.0f
+#define REWARD_DRAW    -0.1f
 #define REWARD_ILLEGAL -0.1f
 
 //Piece helpers
@@ -61,9 +66,6 @@
 #define FILE(sq)         ((sq) % 8)
 #define SQ(r,f)          ((r)*8+(f))
 #define IN_BOUNDS(r,f)   ((r)>=0&&(r)<8&&(f)>=0&&(f)<8)
-#define FROM_ACT(a)      ((a) / 64)
-#define TO_ACT(a)        ((a) % 64)
-#define MAKE_ACT(fr,to)  ((fr)*64+(to))
 
 
 typedef struct Log Log;
@@ -74,6 +76,9 @@ struct Log {
 	float episode_length;
 	float illegal_moves;
 	float draws;
+	float stockfish_moves;
+	float stockfish_fallbacks;
+	float stockfish_cp;
 	float n;
 };
 
@@ -111,6 +116,16 @@ struct Chess {
 
 	int      selfplay;  
 	int      human_side; // 0 none, 1 white, 2 black
+	int      stockfish_enabled;
+	int      stockfish_depth;
+	int      stockfish_movetime_ms;
+	int      ppo_side;
+	int      randomize_ppo_side;
+	int      max_ppo_turns;
+	int      eval_shaping;
+	float    last_stockfish_eval;
+	int      has_stockfish_eval;
+	StockfishEngine stockfish;
 
 	int      tick;
 	int      game_over;
@@ -514,6 +529,126 @@ static int legal_moves(const Chess* env, Move* legal, Move* pseudo) {
 	return nl;
 }
 
+static const int QUEEN_DIRECTIONS[8][2] = {
+	{ 1,  0}, { 1,  1}, { 0,  1}, {-1,  1},
+	{-1,  0}, {-1, -1}, { 0, -1}, { 1, -1},
+};
+
+static const int KNIGHT_DIRECTIONS[8][2] = {
+	{ 2,  1}, { 1,  2}, {-1,  2}, {-2,  1},
+	{-2, -1}, {-1, -2}, { 1, -2}, { 2, -1},
+};
+
+static const int UNDERPROMOTION_PIECES[3] = {2, 3, 4}; // knight, bishop, rook
+
+static inline bool move_reaches_promotion_rank(int side, int to) {
+	return RANK(to) == (side == 0 ? 7 : 0);
+}
+
+static inline Move invalid_decoded_move(void) {
+	return (Move){-1, -1, 0, -1};
+}
+
+static inline int encode_action_index(const Move* m, int side) {
+	if (m->from < 0 || m->from >= BOARD_SQ || m->to < 0 || m->to >= BOARD_SQ) {
+		return -1;
+	}
+
+	int from_r = RANK(m->from);
+	int from_f = FILE(m->from);
+	int to_r = RANK(m->to);
+	int to_f = FILE(m->to);
+	int dr = to_r - from_r;
+	int df = to_f - from_f;
+
+	if (m->promo >= 2 && m->promo <= 4) {
+		int forward = side == 0 ? 1 : -1;
+		if (dr != forward || df < -1 || df > 1) return -1;
+		int piece_idx = m->promo - 2;
+		int dir_idx = df + 1;
+		return m->from * 73 + 64 + piece_idx * 3 + dir_idx;
+	}
+
+	for (int d = 0; d < 8; d++) {
+		for (int dist = 1; dist <= 7; dist++) {
+			if (dr == QUEEN_DIRECTIONS[d][0] * dist &&
+					df == QUEEN_DIRECTIONS[d][1] * dist) {
+				return m->from * 73 + d * 7 + (dist - 1);
+			}
+		}
+	}
+
+	for (int d = 0; d < 8; d++) {
+		if (dr == KNIGHT_DIRECTIONS[d][0] && df == KNIGHT_DIRECTIONS[d][1]) {
+			return m->from * 73 + 56 + d;
+		}
+	}
+
+	return -1;
+}
+
+static inline Move decode_action_index(const Chess* env, int action_idx) {
+	if (action_idx < 0 || action_idx >= ACTION_SPACE_SIZE) return invalid_decoded_move();
+
+	int from = action_idx / 73;
+	int plane = action_idx % 73;
+	int piece = env->board[from];
+	if (piece == EMPTY || PIECE_COLOR(piece) != env->side) return invalid_decoded_move();
+
+	int from_r = RANK(from);
+	int from_f = FILE(from);
+	int to_r = from_r;
+	int to_f = from_f;
+	Move m = {(int8_t)from, -1, 0, -1};
+
+	if (plane < 56) {
+		int dir = plane / 7;
+		int dist = plane % 7 + 1;
+		to_r += QUEEN_DIRECTIONS[dir][0] * dist;
+		to_f += QUEEN_DIRECTIONS[dir][1] * dist;
+	} else if (plane < 64) {
+		int dir = plane - 56;
+		to_r += KNIGHT_DIRECTIONS[dir][0];
+		to_f += KNIGHT_DIRECTIONS[dir][1];
+	} else {
+		int rel = plane - 64;
+		int piece_idx = rel / 3;
+		int dir_idx = rel % 3;
+		to_r += env->side == 0 ? 1 : -1;
+		to_f += dir_idx - 1;
+		m.promo = (int8_t)UNDERPROMOTION_PIECES[piece_idx];
+	}
+
+	if (!IN_BOUNDS(to_r, to_f)) return invalid_decoded_move();
+	m.to = (int8_t)SQ(to_r, to_f);
+
+	if (plane < 64 && PIECE_TYPE(piece) == 1 &&
+			move_reaches_promotion_rank(env->side, m.to)) {
+		m.promo = 5;
+	}
+
+	if (plane >= 64 && (PIECE_TYPE(piece) != 1 ||
+			!move_reaches_promotion_rank(env->side, m.to))) {
+		return invalid_decoded_move();
+	}
+
+	return m;
+}
+
+static void generate_action_mask(const Chess* env, float* mask_out) {
+	memset(mask_out, 0, ACTION_SPACE_SIZE * sizeof(float));
+	if (env->game_over) return;
+
+	Move pseudo[MAX_MOVES], legal[MAX_MOVES];
+	int nl = legal_moves(env, legal, pseudo);
+	for (int i = 0; i < nl; i++) {
+		int action_idx = encode_action_index(&legal[i], env->side);
+		if (action_idx >= 0 && action_idx < ACTION_SPACE_SIZE) {
+			mask_out[action_idx] = 1.0f;
+		}
+	}
+}
+
 static int find_legal_move_index(const Chess* env, int from, int to, int preferred_promo) {
 	Move pseudo[MAX_MOVES], legal[MAX_MOVES];
 	int nl = legal_moves(env, legal, pseudo);
@@ -521,9 +656,10 @@ static int find_legal_move_index(const Chess* env, int from, int to, int preferr
 
 	for (int i = 0; i < nl; i++) {
 		if (legal[i].from != from || legal[i].to != to) continue;
-		if (fallback < 0) fallback = i;
-		if (legal[i].promo == preferred_promo) return i;
-		if (preferred_promo == 0 && legal[i].promo == 0) return i;
+		int action_idx = encode_action_index(&legal[i], env->side);
+		if (fallback < 0) fallback = action_idx;
+		if (legal[i].promo == preferred_promo) return action_idx;
+		if (preferred_promo == 0 && legal[i].promo == 0) return action_idx;
 	}
 
 	return fallback;
@@ -597,7 +733,7 @@ static bool forced_draw(const Chess* env) {
 		insufficient_material(env);
 }
 
-//  Observation encoding   (12 piece planes × 64 + 7 aux = 775)
+//  Observation encoding: 775 board features followed by a 4672 action mask.
 static void encode_obs(Chess* env) {
 	float* obs = env->observations;
 	memset(obs, 0, CHESS_OBS_SIZE * sizeof(float));
@@ -618,6 +754,8 @@ static void encode_obs(Chess* env) {
 	obs[a+4] = env->ep_square >= 0 ? FILE(env->ep_square) / 7.0f : -1.0f;
 	obs[a+5] = env->halfmove_clock / 100.0f;
 	obs[a+6] = (float)env->side;
+
+	generate_action_mask(env, obs + CHESS_ACTION_MASK_OFFSET);
 }
 
 //  Logging
@@ -627,6 +765,7 @@ static void add_log(Chess* env, float reward) {
 	env->log.episode_return += reward;
 	env->log.episode_length += env->tick;
 	env->log.draws          += (reward == REWARD_DRAW) ? 1.0f : 0.0f;
+	if (env->has_stockfish_eval) env->log.stockfish_cp += env->last_stockfish_eval;
 	env->log.n              += 1.0f;
 }
 
@@ -639,26 +778,220 @@ static void play_random_move(Chess* env) {
 	commit_move(env, m);
 }
 
+static inline int stockfish_active(const Chess* env) {
+	return env->stockfish_enabled && !env->selfplay;
+}
+
+static inline int normalized_ppo_side(const Chess* env) {
+	return env->ppo_side == 1 ? 1 : 0;
+}
+
+static inline int controlled_side(const Chess* env) {
+	if (env->human_side == 1) return 0;
+	if (env->human_side == 2) return 1;
+	return normalized_ppo_side(env);
+}
+
+static inline int clamp_int(int value, int lo, int hi) {
+	if (value < lo) return lo;
+	if (value > hi) return hi;
+	return value;
+}
+
+static char piece_to_fen(int8_t piece) {
+	switch (piece) {
+	case W_PAWN:   return 'P';
+	case W_KNIGHT: return 'N';
+	case W_BISHOP: return 'B';
+	case W_ROOK:   return 'R';
+	case W_QUEEN:  return 'Q';
+	case W_KING:   return 'K';
+	case B_PAWN:   return 'p';
+	case B_KNIGHT: return 'n';
+	case B_BISHOP: return 'b';
+	case B_ROOK:   return 'r';
+	case B_QUEEN:  return 'q';
+	case B_KING:   return 'k';
+	default:       return '\0';
+	}
+}
+
+static void board_to_fen(const Chess* env, char* out, size_t out_sz) {
+	char board_part[96];
+	int n = 0;
+	for (int r = 7; r >= 0; r--) {
+		int empty = 0;
+		for (int f = 0; f < 8; f++) {
+			int8_t piece = env->board[SQ(r, f)];
+			if (piece == EMPTY) {
+				empty++;
+				continue;
+			}
+			if (empty > 0) {
+				board_part[n++] = (char)('0' + empty);
+				empty = 0;
+			}
+			board_part[n++] = piece_to_fen(piece);
+		}
+		if (empty > 0) board_part[n++] = (char)('0' + empty);
+		if (r > 0) board_part[n++] = '/';
+	}
+	board_part[n] = '\0';
+
+	char castling[5];
+	int c = 0;
+	if (env->castling & CASTLE_WK) castling[c++] = 'K';
+	if (env->castling & CASTLE_WQ) castling[c++] = 'Q';
+	if (env->castling & CASTLE_BK) castling[c++] = 'k';
+	if (env->castling & CASTLE_BQ) castling[c++] = 'q';
+	if (c == 0) castling[c++] = '-';
+	castling[c] = '\0';
+
+	char ep[3] = {'-', '\0', '\0'};
+	int8_t normalized_ep = normalized_ep_square_board(
+		env->board, env->side, env->ep_square);
+	if (normalized_ep >= 0) {
+		ep[0] = (char)('a' + FILE(normalized_ep));
+		ep[1] = (char)('1' + RANK(normalized_ep));
+		ep[2] = '\0';
+	}
+
+	snprintf(out, out_sz, "%s %c %s %s %d %d",
+		board_part,
+		env->side == 0 ? 'w' : 'b',
+		castling,
+		ep,
+		env->halfmove_clock,
+		env->fullmove);
+}
+
+static int uci_square_to_index(const char* s) {
+	if (s[0] < 'a' || s[0] > 'h' || s[1] < '1' || s[1] > '8') return -1;
+	return SQ(s[1] - '1', s[0] - 'a');
+}
+
+static int promotion_from_uci(char c) {
+	switch (c) {
+	case 'n': return 2;
+	case 'b': return 3;
+	case 'r': return 4;
+	case 'q': return 5;
+	default:  return 0;
+	}
+}
+
+static bool legal_move_from_uci(const Chess* env, const char* uci, Move* out) {
+	if (uci == NULL || strlen(uci) < 4) return false;
+	int from = uci_square_to_index(uci);
+	int to = uci_square_to_index(uci + 2);
+	int promo = strlen(uci) >= 5 ? promotion_from_uci(uci[4]) : 0;
+	if (from < 0 || to < 0) return false;
+
+	Move pseudo[MAX_MOVES], legal[MAX_MOVES];
+	int n = legal_moves(env, legal, pseudo);
+	for (int i = 0; i < n; i++) {
+		if (legal[i].from != from || legal[i].to != to) continue;
+		if (legal[i].promo == promo ||
+				(promo == 0 && legal[i].promo == 0)) {
+			*out = legal[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+static int stockfish_score_for_ppo(const Chess* env, const StockfishResult* result) {
+	int score = clamp_int(result->score_cp, -4000, 4000);
+	return env->side == controlled_side(env) ? score : -score;
+}
+
+static float stockfish_eval_reward(Chess* env, int cp_for_ppo) {
+	if (!env->eval_shaping) return 0.0f;
+
+	float eval_cp = (float)clamp_int(cp_for_ppo, -2000, 2000);
+	float reward = 0.01f * tanhf(eval_cp / 600.0f);
+	if (env->has_stockfish_eval) {
+		float delta = eval_cp - env->last_stockfish_eval;
+		reward += 0.04f * tanhf(delta / 250.0f);
+	}
+	env->last_stockfish_eval = eval_cp;
+	env->has_stockfish_eval = 1;
+	return reward;
+}
+
+static bool play_stockfish_move(Chess* env, float* shaped_reward) {
+	if (shaped_reward != NULL) *shaped_reward = 0.0f;
+
+	char fen[128];
+	board_to_fen(env, fen, sizeof(fen));
+
+	StockfishResult result;
+	if (stockfish_go(&env->stockfish, fen, env->stockfish_depth,
+			env->stockfish_movetime_ms, &result)) {
+		if (result.has_score && shaped_reward != NULL) {
+			int cp_for_ppo = stockfish_score_for_ppo(env, &result);
+			*shaped_reward = stockfish_eval_reward(env, cp_for_ppo);
+		}
+
+		Move chosen;
+		if (legal_move_from_uci(env, result.bestmove, &chosen)) {
+			commit_move(env, &chosen);
+			env->log.stockfish_moves += 1.0f;
+			return true;
+		}
+	}
+
+	env->log.stockfish_fallbacks += 1.0f;
+	play_random_move(env);
+	return false;
+}
+
+static float no_legal_moves_reward(const Chess* env, bool side_in_check) {
+	if (!side_in_check) return REWARD_DRAW;
+	int winner = 1 - env->side;
+	return winner == controlled_side(env) ? REWARD_WIN : REWARD_LOSS;
+}
+
 //  Reset
 void c_reset(Chess* env) {
 	set_start_position(env);
+	if (env->randomize_ppo_side) {
+		env->ppo_side = (int)(rand_r(&env->rng) & 1);
+	}
+
 	env->tick       = 0;
 	env->game_over  = 0;
 	env->rewards[0]   = 0.0f;
 	env->terminals[0] = 0.0f;
+	env->last_stockfish_eval = 0.0f;
+	env->has_stockfish_eval = 0;
 	reset_position_history(env);
+
+	if (stockfish_active(env)) {
+		if (!stockfish_new_game(&env->stockfish)) {
+			env->log.stockfish_fallbacks += 1.0f;
+		}
+		if (env->side != controlled_side(env)) {
+			play_stockfish_move(env, NULL);
+		}
+	}
+
 	encode_obs(env);
 }
 
 void init(Chess* env) {
+	stockfish_engine_init(&env->stockfish);
 	env->tick = 0;
 	env->selected_sq = -1;
 	if (env->rng == 0) env->rng = (unsigned int)time(NULL);
+	if (env->stockfish_depth <= 0) env->stockfish_depth = 8;
+	if (env->max_ppo_turns <= 0) env->max_ppo_turns = 200;
+	env->ppo_side = normalized_ppo_side(env);
 }
 
 //  Step
 void c_step(Chess* env) {
-	env->rewards[0]   = 0.0f;
+	env->rewards[0]   = -0.002f;
 	env->terminals[0] = 0.0f;
 
 	if (env->game_over) {
@@ -666,13 +999,12 @@ void c_step(Chess* env) {
 		return;
 	}
 
-	// Build current legal move list
 	Move pseudo[MAX_MOVES], legal[MAX_MOVES];
 	int nl = legal_moves(env, legal, pseudo);
 	bool side_in_check = in_check(env->board, env->side);
 
 	if (nl == 0) {
-		float r = side_in_check ? REWARD_LOSS : REWARD_DRAW;
+		float r = no_legal_moves_reward(env, side_in_check);
 		env->rewards[0]   = r;
 		env->terminals[0] = 1.0f;
 		env->game_over    = 1;
@@ -690,31 +1022,71 @@ void c_step(Chess* env) {
 		return;
 	}
 
-	int action;
+	if (stockfish_active(env) && env->side != controlled_side(env)) {
+		play_stockfish_move(env, NULL);
+		nl = legal_moves(env, legal, pseudo);
+		side_in_check = in_check(env->board, env->side);
+		if (nl == 0) {
+			float r = no_legal_moves_reward(env, side_in_check);
+			env->rewards[0]   = r;
+			env->terminals[0] = 1.0f;
+			env->game_over    = 1;
+			add_log(env, r);
+		} else if (forced_draw(env)) {
+			env->rewards[0]   = REWARD_DRAW;
+			env->terminals[0] = 1.0f;
+			env->game_over    = 1;
+			add_log(env, REWARD_DRAW);
+		}
+		encode_obs(env);
+		return;
+	}
+
+	int action_idx;
 	if (is_human_turn(env)) {
 		if (env->pending_human_action < 0) {
 			encode_obs(env);
 			return;
 		}
-		action = env->pending_human_action;
+		action_idx = env->pending_human_action;
 		env->pending_human_action = -1;
 	} else {
-		action = (int)env->actions[0];
-		if (action < 0) action = 0;
+		float action_value = env->actions[0];
+		action_idx = isfinite(action_value) ? (int)action_value : -1;
 	}
-	Move* chosen = &legal[action % nl];
+
+	Move decoded = decode_action_index(env, action_idx);
+	Move chosen = decoded;
+	bool is_valid = false;
+	for (int i = 0; i < nl; i++) {
+		if (legal[i].from == decoded.from &&
+				legal[i].to == decoded.to &&
+				legal[i].promo == decoded.promo) {
+			chosen = legal[i];
+			is_valid = true;
+			break;
+		}
+	}
+
+	if (!is_valid) {
+		env->rewards[0] = REWARD_ILLEGAL;
+		env->terminals[0] = 1.0f;
+		env->game_over = 1;
+		env->log.illegal_moves += 1.0f;
+		add_log(env, REWARD_ILLEGAL);
+		encode_obs(env);
+		return;
+	}
+
 	env->tick++;
 
-	// Apply player's move
-	commit_move(env, chosen);
+	commit_move(env, &chosen);
 
-	// Check if opponent has any legal moves (checkmate / stalemate)
 	int opp_moves = legal_moves(env, legal, pseudo);
-
 	bool opp_in_check = in_check(env->board, env->side);
 
 	if (opp_moves == 0) {
-		float r = opp_in_check ? REWARD_WIN : REWARD_DRAW;
+		float r = no_legal_moves_reward(env, opp_in_check);
 		env->rewards[0]   = r;
 		env->terminals[0] = 1.0f;
 		env->game_over    = 1;
@@ -732,15 +1104,28 @@ void c_step(Chess* env) {
 		return;
 	}
 
-	// Opponent response (random unless selfplay where PPO drives next c_step)
-	if (!env->selfplay && env->human_side == 0) {
-		play_random_move(env);
+	if (env->tick >= env->max_ppo_turns) {
+		env->rewards[0]   = REWARD_DRAW;
+		env->terminals[0] = 1.0f;
+		env->game_over    = 1;
+		add_log(env, REWARD_DRAW);
+		encode_obs(env);
+		return;
+	}
 
-		// Now check if PPO side has legal moves
+	if (!env->selfplay) {
+		float shaped_reward = 0.0f;
+		if (env->stockfish_enabled) {
+			play_stockfish_move(env, &shaped_reward);
+		} else {
+			play_random_move(env);
+		}
+		env->rewards[0] += shaped_reward;
+
 		int my_moves = legal_moves(env, legal, pseudo);
 		bool my_in_check = in_check(env->board, env->side);
 		if (my_moves == 0) {
-			float r = my_in_check ? REWARD_LOSS : REWARD_DRAW;
+			float r = no_legal_moves_reward(env, my_in_check);
 			env->rewards[0]   = r;
 			env->terminals[0] = 1.0f;
 			env->game_over    = 1;
@@ -756,9 +1141,7 @@ void c_step(Chess* env) {
 	encode_obs(env);
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 //  Rendering
-// ─────────────────────────────────────────────────────────────────────────
 static const Color LIGHT_SQ    = {239, 217, 190, 255};
 static const Color DARK_SQ     = {164, 120,  90, 255};
 static const Color MOVE_SQ     = {236, 205,  95, 180};
@@ -949,7 +1332,9 @@ void c_render(Chess* env) {
 
 	char status[160];
 	const char* turn_str = env->side == 0 ? "White" : "Black";
-	const char* mode_str = env->selfplay ? "human vs human" : "human vs random black";
+	const char* mode_str = env->selfplay ? "self play" :
+		(env->human_side != 0 && env->stockfish_enabled ? "human vs Stockfish" :
+		(env->stockfish_enabled ? "PPO vs Stockfish" : "PPO vs random"));
 	snprintf(status, sizeof(status), "Move %d   %s to move   mode: %s",
 		env->fullmove, turn_str, mode_str);
 	DrawTextEx(cl->font, status, (Vector2){16.0f, (float)status_top}, 18.0f, 0.0f, TEXT_MAIN);
@@ -963,6 +1348,7 @@ void c_render(Chess* env) {
 }
 
 void c_close(Chess* env) {
+	stockfish_stop(&env->stockfish);
 	if (env->client) {
 		for (int piece = 1; piece <= 12; piece++) {
 			if (env->client->pieces[piece].id != 0) {

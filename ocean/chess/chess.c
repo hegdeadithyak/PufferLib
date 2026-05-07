@@ -13,6 +13,7 @@ static int mouse_to_square(Vector2 mouse) {
 }
 
 static void handle_click(Chess* env) {
+	if (env->human_side != 0) return;
 	if (!IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) return;
 
 	int sq = mouse_to_square(GetMousePosition());
@@ -71,6 +72,10 @@ int main(void) {
 	allocate_cchess(&env);
 	env.num_agents = 1;
 	env.selfplay = 0;
+	env.human_side = 1;
+	env.stockfish_enabled = 1;
+	env.stockfish_depth = 8;
+	env.max_ppo_turns = 300;
 	init(&env);
 	c_reset(&env);
 
@@ -78,6 +83,7 @@ int main(void) {
 		handle_keyboard(&env);
 		handle_click(&env);
 		c_render(&env);
+		c_step(&env);
 	}
 
 	c_close(&env);

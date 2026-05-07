@@ -25,6 +25,7 @@ dependencies = [
     "scikit-learn",
     "wandb",
     "pybind11",
+    "chess>=1.11",
 ]
 
 [project.scripts]
